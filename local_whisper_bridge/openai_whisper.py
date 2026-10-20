@@ -74,11 +74,11 @@ class OpenAIWhisperClient:
         if response.status_code == 429:
             raise OpenAIWhisperError(429, "OpenAI rate limit or quota reached.")
         if not response.is_success:
-            raise OpenAIWhisperError(502, f"OpenAI transcription failed (HTTP {response.status_code}).")
+            raise OpenAIWhisperError(503, f"OpenAI transcription failed (HTTP {response.status_code}).")
         try:
             result = response.json()
         except ValueError as exc:
-            raise OpenAIWhisperError(502, "OpenAI returned invalid JSON.") from exc
+            raise OpenAIWhisperError(503, "OpenAI returned invalid JSON.") from exc
         if not isinstance(result, dict) or not isinstance(result.get("text"), str):
-            raise OpenAIWhisperError(502, "OpenAI returned no transcript text.")
+            raise OpenAIWhisperError(503, "OpenAI returned no transcript text.")
         return {"text": result["text"], "model": MODEL, "provider": "openai"}
