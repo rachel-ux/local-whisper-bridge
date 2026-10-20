@@ -1,94 +1,93 @@
-# Local Whisper Bridge
+# Offline Model Inference API
 
-Local Whisper Bridge is a FastAPI proof of concept for comparing two transcription paths: OpenAI's hosted `whisper-1` API and an offline, CPU-based Whisper Tiny checkpoint. Its own optimization is **quiet-gap rescue**: after a fast first local decode, it spends a bounded amount of extra inference on low-volume parts of the audio that received little transcript coverage.
+A local-only FastAPI service with a registry of model pipelines. The default model is a pre-downloaded Whisper Base checkpoint running through `faster-whisper`. A text classifier can be enabled by pointing `TEXT_MODEL_PATH` at a locally stored Hugging Face sequence-classification checkpoint. The inference server never downloads weights or calls a hosted AI API.
 
-The project is a transcription lab, not a Wispr Flow integration. It does not run Wispr's proprietary model, modify Wispr Flow, or demonstrate that Whisper Tiny meets a phone or watch latency target. The browser records consecutive six-second files; each file is transcribed after that clip ends. A slow inference pass can fall behind recording.
-
-## How the two paths work
-
-| Mode in the browser | Processing | Network | What it demonstrates |
-| --- | --- | --- | --- |
-| **Offline with quiet-gap rescue** | Whisper Tiny on this computer's CPU, followed by selective local retries | None during transcription | The custom inference policy |
-| **Offline baseline** | The same local model and first-pass settings, without retries | None during transcription | An A/B comparison against rescue |
-| **OpenAI only** | Hosted `whisper-1` through `POST /openai/transcribe` | Required | A real cloud transcription call |
-| **Automatic** | OpenAI first; local rescue if the browser receives a connection or timeout error (`502` or `504`) | Usually required; falls back locally | A narrow connectivity fallback, not a general quality router |
-
-The server binds to `127.0.0.1`. An OpenAI API key stays in the server environment or the ignored `.env.local` file; the browser does not receive it. The offline model is downloaded explicitly by `prepare` and is loaded from disk thereafter. Offline transcription does not download a model or send audio to OpenAI.
-
-## The local optimization
-
-The diagram follows `LocalWhisperEngine.transcribe()` in [`local_whisper_bridge/local_engine.py`](local_whisper_bridge/local_engine.py). It shows **where extra compute is spent**: only candidates that survive the quiet-gap tests and fit the retry budget get a second decode.
-
-```mermaid
-flowchart TD
-    A[Audio file] --> B[Decode to mono 16 kHz samples]
-    B --> C[First pass: Whisper Tiny on CPU<br/>beam 1, VAD on]
-    C --> D[Timestamped transcript segments]
-    B --> E[Measure RMS energy in 100 ms frames]
-    D --> F[Mark time covered by first-pass segments]
-    E --> G[Find sustained, above-noise-floor<br/>low-volume regions]
-    F --> G
-    G --> H{Transcript coverage<br/>below 15%?}
-    H -- No --> M[Keep first-pass transcript]
-    H -- Yes --> I[Rank candidates and select<br/>at most 20% of audio or 30 s]
-    I --> J[Retry selected clips locally<br/>beam 3, VAD off]
-    J --> K{Text present, log probability<br/>above -0.75, no-speech probability below 0.5?}
-    K -- No --> M
-    K -- Yes --> L[Restore original timestamps<br/>and merge by start time]
-    D --> L
-    L --> N[Transcript + measured timing<br/>and retry metadata]
-    M --> N
+```text
+local-whisper-bridge/
+├── pipelines/
+│   ├── __init__.py
+│   ├── base.py                 # Device resolver, abstract contract, registry
+│   ├── whisper_pipeline.py     # Offline speech recognition
+│   └── text_pipeline.py        # Offline text classification
+├── models/
+│   └── whisper-base/           # Prepared local checkpoint, ignored by Git
+├── main.py                     # Thread settings, model lifecycle, API
+└── requirements.txt
 ```
 
-The first pass uses `faster-whisper` with CTranslate2. It selects `int8` CPU compute **if supported**, otherwise `float32`; this is an existing runtime capability, not a quantization algorithm invented by this project. The first pass uses `beam_size=1` and `vad_filter=True` to avoid spending the same compute on every portion of a clip.
+## Run
 
-Quiet-gap rescue is the project's custom controller:
-
-1. **Measure energy.** It splits decoded 16 kHz audio into 100 ms frames and calculates each frame's root-mean-square (RMS) amplitude. The 20th percentile, with a minimum floor, estimates background level. It selects frames above that floor but below an upper threshold, bridges a one-frame interruption, and requires at least 300 ms of candidate audio. Each candidate receives 250 ms of padding on both sides.
-2. **Find what the first pass missed.** It compares each candidate's time span with the first-pass transcript segments. A candidate proceeds only when transcript coverage is under 15%. This is a timestamp heuristic; an uncovered region is not proof of speech.
-3. **Spend a fixed retry budget.** It ranks candidates by duration and energy above the floor, rejects overlapping selections, and retries no more than the smaller of **20% of the recording** or **30 seconds**. Some eligible candidates may be skipped when the budget is exhausted.
-4. **Decode differently and filter the result.** Each selected clip is decoded again with `beam_size=3`, `vad_filter=False`, `temperature=0`, and `condition_on_previous_text=False`. The engine accepts nonempty text only if the model reports `avg_logprob > -0.75` and `no_speech_prob < 0.5`. It translates accepted clip timestamps back to the original recording and sorts them with the first-pass segments.
-
-The response includes `text`, timestamped `segments`, and `optimization` measurements: audio duration, duration retained after first-pass VAD, first-pass and total wall time, real-time factor (`total_seconds / audio_seconds`), retried spans, and the number of recovered segments. Set `rescue=false` to run the otherwise identical offline baseline. This policy may recover quiet speech, but energy and model confidence are imperfect: it can retry noise, miss soft speech, duplicate words, or hallucinate. The budget caps *audio duration retried*, not wall-clock latency or CPU use.
-
-### Where this would fit in a local-first dictation architecture
-
-For an application that already captures PCM, the policy would sit **after capture and before cloud ASR**. A local worker would consume the captured samples and return transcript segments to the application's normal text-output path. A cloud fallback would receive audio only when the local path cannot finish acceptably. The current FastAPI app illustrates the local inference and retry policy; it does **not** implement that integration or a production confidence-based cloud router. Sending every locally processed clip to cloud as well would retain cloud inference cost.
-
-## Run it
-
-From the project directory, on the prepared development computer:
+From this directory:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
-local-whisper-bridge serve
+python -m pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8765
 ```
 
-Open <http://127.0.0.1:8765/>. Upload an audio file or start the microphone, then choose a processing mode. The browser reports which provider returned a transcript and shows local optimization timings when applicable.
-
-On a new computer, install and prepare the model once while online:
+The prepared `models/whisper-base` checkpoint is available on this development computer. It is ignored by Git, so on a new machine **prepare the weights once while online, before starting the offline server**:
 
 ```bash
-python -m pip install -e '.[test]'
-local-whisper-bridge prepare
-local-whisper-bridge serve
+python - <<'PY'
+from faster_whisper.utils import download_model
+download_model("base", output_dir="models/whisper-base")
+PY
 ```
 
-`prepare` downloads the Whisper Tiny checkpoint into `models/tiny` by default. Set `LWB_MODEL_DIR` before preparing and serving if you need another model-storage location. The offline inference route requires that prepared checkpoint; it does not silently fall back to OpenAI.
+After preparation, disconnect the network if desired and start the server. Startup fails clearly if `model.bin` is missing. The endpoint will not substitute a remote model.
 
-To enable the cloud mode, set `OPENAI_API_KEY` in the server environment or put `OPENAI_API_KEY=...` in an ignored `.env.local` in the directory where you start the server. OpenAI requests need internet access and may incur API charges. A live OpenAI call has not been verified for this project because no key is configured here.
+The service binds to loopback in the example command. Do not expose it to other hosts without adding authentication, request limits, and deployment-specific controls.
 
-### API and verification
+## Inference
 
-- `GET /openai/status` reports whether a key is configured and the local checkpoint is ready.
-- `POST /offline/transcribe` accepts a multipart `file`; use `?rescue=false` for the baseline.
-- `POST /openai/transcribe` accepts a multipart `file` and calls OpenAI `whisper-1`.
-- Both upload routes reject empty files, unsupported extensions, and files over 25 MiB. The offline route processes a temporary file and removes it afterward.
+The generic endpoint accepts multipart form data. Use a `file` for Whisper or `text` for a text classifier; send exactly one. It loads each configured model once during startup, queues concurrent requests per model, and deletes uploaded temporary files even when inference fails.
 
-Run the tests with `python -m pytest -q`. They cover the gap planner's budget, a mocked second decode, separation of the offline route, and the OpenAI request handling. They do not establish accuracy or performance across devices.
+```bash
+curl -sS -F "file=@recording.wav" http://127.0.0.1:8765/api/v1/infer/whisper
+curl -sS http://127.0.0.1:8765/health
+```
 
-## Evidence and limits
+The Whisper response includes detected language, language probability, duration, timestamped segments, joined text, and the actual device and compute type. Uploads are limited to 25 MiB. Supported input extensions are WAV, MP3, M4A, MP4, MPEG, MPGA, WebM, OGG, and FLAC; `faster-whisper` decodes the file locally.
 
-On the OpenAI Whisper repository's 11-second JFK sample, both local modes returned the expected sentence and rescue found no span to retry. In one constructed 18-second test, appending a three-second section at 3.5% amplitude caused the baseline to omit a quiet phrase; rescue retried 13.05–15.25 seconds and recovered “And so, my fellow Americans.” One warmed run took about 1.5 seconds end to end on this Mac. This is a demonstration case, **not** a measured word-error-rate improvement or a device-speed benchmark.
+To enable text classification, first prepare a compatible sequence-classification model and tokenizer into a local directory, then set `TEXT_MODEL_PATH` before startup. This development computer has a DistilBERT sentiment checkpoint in `models/text-sentiment`, but model files are ignored by Git. On another machine, prepare it while online:
 
-Before claiming a product benefit, test consented quiet speech, noisy rooms, multiple accents and languages, overlapping speakers, and silence. Report word error rate, false additions, median and tail latency, CPU load, memory, and power alongside baseline results. The Python prototype currently runs on a computer. iPhone, Android, and Apple Watch deployment would require a native capture and inference runtime, model packaging, and measurements on those devices.
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+    local_dir="models/text-sentiment",
+    allow_patterns=["config.json", "model.safetensors", "tokenizer_config.json", "vocab.txt"],
+)
+PY
+```
+
+The server will only read these files. Its offline policy remains active when the text pipeline is enabled.
+
+```bash
+TEXT_MODEL_PATH="$PWD/models/text-sentiment" uvicorn main:app --host 127.0.0.1 --port 8765
+curl -sS -F "text=This is useful" http://127.0.0.1:8765/api/v1/infer/text-classifier
+```
+
+`GET /health` lists loaded models. The inference endpoint returns `404` for an unloaded name, `400` for invalid input, and a generic `500` for an inference failure; detailed failures remain in server logs.
+
+## How hardware selection works
+
+`resolve_device_and_compute("auto", backend=...)` centrally checks CUDA, then MPS, then CPU against the selected runtime's capabilities. It chooses `float16` for a supported GPU or `int8` for CPU (falling back to CPU `float32` only if that runtime lacks int8). Pipelines declare their inference backend instead of choosing their own device. Set `WHISPER_DEVICE` or `TEXT_MODEL_DEVICE` to `cpu`, `cuda`, or `mps` to request a specific device; unavailable explicit devices fail at startup.
+
+There is an important backend distinction: **CTranslate2/faster-whisper does not support MPS**. On an Apple Silicon Mac without CUDA, the resolver selects **CPU int8 for Whisper** and **MPS float16 for the PyTorch classifier**. Explicit `WHISPER_DEVICE=mps` fails with an explanation. If PyTorch sees CUDA but the installed CTranslate2 build cannot use it, automatic Whisper selection falls back to CPU; an explicit unsupported request fails. On CPU the text classifier attempts dynamic int8 quantization of supported linear layers. If its PyTorch build lacks a required quantized backend, it uses float32 and reports that actual precision in `/health` and inference responses.
+
+`main.py` sets `OMP_NUM_THREADS` from the available logical CPUs **before importing either ML runtime**. `WHISPER_CPU_THREADS` overrides this default and is also passed to CTranslate2. More threads are not always faster: benchmark the actual model and audio length on your hardware, especially when several requests arrive together.
+
+```bash
+WHISPER_CPU_THREADS=4 uvicorn main:app --host 127.0.0.1 --port 8765
+```
+
+The code forces Hugging Face and Transformers offline mode and passes `local_files_only=True` when loading both pipeline types. These settings prevent model fetches; they do not make a model small or guarantee real-time transcription on every device. For an isolated deployment, install dependencies and prepare model files beforehand, then run in an environment with outbound access disabled.
+
+## Add another model
+
+Subclass `BaseModelPipeline`, set `input_kind` to `"file"` or `"text"`, implement `load_model()` and `run(input_data)`, and decorate the class with `@PipelineRegistry.register("your-name")`. Import its module from `pipelines/__init__.py`, then add a local path to the configuration returned by `configured_models()` in `main.py`. Keep model loading local and report the device and precision actually used.
+
+The default Whisper path uses `beam_size=1` for CPU throughput and does not apply VAD, which avoids automatically dropping very quiet speech. This is a deliberate baseline, not a universal accuracy optimum. Benchmark latency, transcription error, memory, and power before changing beam size or CPU thread count for production.
