@@ -6,20 +6,23 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .engine import LocalWhisperEngine, repair_model, selected_model
 from .lab import compare
+from .openai_whisper import OpenAIWhisperClient, OpenAIWhisperError, api_key
 
 MAX_BYTES = 25 * 1024 * 1024
 ALLOWED_SUFFIXES = {".wav", ".mp3", ".m4a", ".mp4", ".flac", ".ogg", ".webm"}
+OPENAI_SUFFIXES = {".wav", ".mp3", ".m4a", ".mp4", ".mpeg", ".mpga", ".webm"}
 
 
-def create_app(engine: Any | None = None) -> FastAPI:
+def create_app(engine: Any | None = None, cloud: Any | None = None) -> FastAPI:
     app = FastAPI(title="Local Whisper Bridge", version="0.1.0")
     transcription_engine = engine if engine is not None else LocalWhisperEngine()
+    cloud_client = cloud if cloud is not None else OpenAIWhisperClient()
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -36,11 +39,48 @@ def create_app(engine: Any | None = None) -> FastAPI:
     def lab_page():
         return FileResponse(Path(__file__).with_name("lab.html"))
 
+    @app.get("/openai")
+    def openai_page():
+        return FileResponse(Path(__file__).with_name("openai.html"))
+
+    @app.get("/openai/status")
+    def openai_status():
+        return {"configured": bool(api_key()), "model": "whisper-1", "mode": "file and rolling microphone clips"}
+
+    @app.post("/openai/transcribe")
+    async def openai_transcribe(
+        request: Request,
+        file: UploadFile = File(...),
+        language: str | None = Form(None),
+        prompt: str | None = Form(None),
+    ):
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            raise HTTPException(403, "Cross-origin transcription requests are blocked")
+        if not api_key():
+            raise HTTPException(503, "Add OPENAI_API_KEY to .env.local or the server environment first.")
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in OPENAI_SUFFIXES:
+            raise HTTPException(400, "OpenAI Whisper accepts WAV, MP3, M4A, MP4, MPEG, MPGA, or WebM")
+        try:
+            content = await file.read(MAX_BYTES + 1)
+            if len(content) > MAX_BYTES:
+                raise HTTPException(413, "Audio file exceeds the 25 MB limit")
+            if not content:
+                raise HTTPException(400, "Audio file is empty")
+            try:
+                return await cloud_client.transcribe(content, file.filename or "audio.webm", language, prompt)
+            except OpenAIWhisperError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
+        finally:
+            await file.close()
+
     @app.post("/lab/compare")
     async def lab_compare(
         file: UploadFile = File(...),
         language: str | None = Form(None),
         reference: str | None = Form(None),
+        budget_percent: int = Form(30, ge=0, le=100),
         authorization: str | None = Header(None),
     ):
         token = os.environ.get("LWB_TOKEN")
@@ -64,7 +104,7 @@ def create_app(engine: Any | None = None) -> FastAPI:
             if size == 0:
                 raise HTTPException(400, "Audio file is empty")
             try:
-                return await run_in_threadpool(compare, path, language, reference)
+                return await run_in_threadpool(compare, path, language, reference, budget_percent)
             except (RuntimeError, TimeoutError) as exc:
                 raise HTTPException(422, str(exc)) from exc
         finally:

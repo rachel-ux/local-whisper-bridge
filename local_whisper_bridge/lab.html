@@ -8,11 +8,11 @@
 </style>
 </head>
 <body>
-<header><div class="brand"><span class="mark">∿</span> Whisper Device Lab</div><span class="tag">LOCAL POC</span></header>
+<header><div class="brand"><span class="mark">∿</span> Whisper Device Lab</div><a href="/openai">OpenAI Whisper live calls →</a><span class="tag">LOCAL POC</span></header>
 <main>
-  <div class="eyebrow">One checkpoint · two execution modes</div>
-  <h1>How much lighter can the same voice model run?</h1>
-  <p class="lead">Upload or record a short clip. This lab runs the same Whisper checkpoint twice on this computer: once using CPU float32 and once using CPU int8. Compare the real transcript, time, and peak process memory.</p>
+  <div class="eyebrow">One checkpoint · measured decisions</div>
+  <h1>Spend precision where the words are uncertain.</h1>
+  <p class="lead">This is real Whisper inference, not sample text. The precision controller first transcribes with int8, scores uncertain spans, then selectively rechecks them with float32 using the same checkpoint. Compare its decisions with full int8 and full float32.</p>
   <form id="form" class="panel">
     <div class="grid">
       <div>
@@ -22,6 +22,7 @@
       <div>
         <div class="field"><label for="language">Language <small>(optional)</small></label><input id="language" name="language" type="text" placeholder="Auto-detect, or enter en / hi / etc."></div>
         <div class="field"><label for="reference">Verified transcript <small>(optional)</small></label><textarea id="reference" name="reference" placeholder="Paste exact words to calculate word error rate"></textarea></div>
+        <div class="field"><label for="budget">Float32 recheck target: <span id="budget-value">30%</span> of audio</label><input id="budget" name="budget_percent" type="range" min="0" max="100" step="5" value="30" style="width:100%"><small>One indivisible utterance may exceed the target; the measured overrun is shown below.</small></div>
         <p class="hint">For a meaningful quality comparison, use a human-corrected reference. Without one, different output does not tell us which result is better.</p>
       </div>
     </div>
@@ -30,6 +31,8 @@
   <section id="results" class="hidden" aria-live="polite">
     <h2 class="section-title">Measured on this computer</h2>
     <div class="grid"><article class="result" id="baseline"></article><article class="result" id="optimized"></article></div>
+    <article class="result" id="adaptive" style="margin-top:22px"></article>
+    <article class="result" style="margin-top:22px"><h3>Why the controller rechecked audio</h3><div id="decisions" class="hint"></div></article>
     <p id="method" class="footer"></p>
   </section>
 </main>
@@ -38,6 +41,8 @@ const form=document.getElementById('form'),audio=document.getElementById('audio'
 record.onclick=async()=>{if(recorder?.state==='recording'){recorder.stop();record.textContent='● Record with microphone';return}try{stream=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];recorder=new MediaRecorder(stream);recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};recorder.onstop=()=>{const type=recorder.mimeType||'audio/webm',ext=type.includes('mp4')?'m4a':type.includes('ogg')?'ogg':'webm';const file=new File(chunks,`recording.${ext}`,{type});const transfer=new DataTransfer();transfer.items.add(file);audio.files=transfer.files;recordStatus.textContent=`Recorded ${Math.round(file.size/1024)} KB`;stream.getTracks().forEach(t=>t.stop())};recorder.start();record.textContent='■ Stop recording';recordStatus.textContent='Recording locally…'}catch(e){recordStatus.textContent='Microphone unavailable: '+e.message}};
 function addMetric(parent,label,value){let row=document.createElement('div');row.className='metric';let l=document.createElement('span'),v=document.createElement('strong');l.textContent=label;v.textContent=value;row.append(l,v);parent.append(row)}
 function showCard(id,title,data){let card=document.getElementById(id);card.replaceChildren();let heading=document.createElement('h3');heading.textContent=title;card.append(heading);addMetric(card,'Compute',data.compute_type);addMetric(card,'Total time',data.total_seconds+' s');addMetric(card,'Inference time',data.inference_seconds+' s');addMetric(card,'Peak process memory',data.peak_process_mb+' MB');if(data.word_error_rate!==null)addMetric(card,'Word error rate',(data.word_error_rate*100).toFixed(1)+'%');let heading2=document.createElement('h3');heading2.textContent='Transcript';heading2.style.marginTop='24px';card.append(heading2);let text=document.createElement('div');text.className='transcript';text.textContent=data.text||'(No speech detected)';card.append(text)}
-form.onsubmit=async e=>{e.preventDefault();if(!audio.files.length)return;button.disabled=true;status.className='status';status.textContent='Running both variants locally. This may take a few minutes…';let body=new FormData();body.append('file',audio.files[0]);for(const key of ['language','reference']){const value=document.getElementById(key).value.trim();if(value)body.append(key,value)}try{const response=await fetch('/lab/compare',{method:'POST',body});const data=await response.json();if(!response.ok)throw Error(data.detail||'Comparison failed');showCard('baseline','Baseline · float32',data.baseline);showCard('optimized','Optimized · int8',data.optimized);document.getElementById('method').textContent=`Checkpoint: ${data.checkpoint} · Model file: ${data.model_file_mb} MB · Device: ${data.device.system} ${data.device.machine}. ${data.method}. ${data.limitations}`;document.getElementById('results').classList.remove('hidden');status.textContent='Comparison complete';document.getElementById('results').scrollIntoView({behavior:'smooth'})}catch(err){status.textContent=err.message;status.className='status error'}finally{button.disabled=false}};
+const budget=document.getElementById('budget');budget.oninput=()=>document.getElementById('budget-value').textContent=budget.value+'%';
+function showDecisions(data){const parent=document.getElementById('decisions');parent.replaceChildren();if(!data.decisions.length){parent.textContent=`No span fit the risk rule and ${data.budget_seconds}s budget. ${data.candidates_found} candidates were scored; no text was hard-coded or replaced.`;return}for(const d of data.decisions){const line=document.createElement('div');line.className='metric';const text=document.createElement('span');text.textContent=`${d.start}–${d.end}s · risk ${d.risk} · ${d.reason}`;const change=document.createElement('strong');change.textContent=d.changed?`“${d.before||'(missing)'}” → “${d.after}”`:'Rechecked; no change';line.append(text,change);parent.append(line)}}
+form.onsubmit=async e=>{e.preventDefault();if(!audio.files.length)return;button.disabled=true;status.className='status';status.textContent='Running same-checkpoint inference and ranking uncertain spans locally…';let body=new FormData();body.append('file',audio.files[0]);body.append('budget_percent',budget.value);for(const key of ['language','reference']){const value=document.getElementById(key).value.trim();if(value)body.append(key,value)}try{const response=await fetch('/lab/compare',{method:'POST',body});const data=await response.json();if(!response.ok)throw Error(data.detail||'Comparison failed');showCard('baseline','Baseline · full float32',data.baseline);showCard('optimized','Fast · full int8',data.optimized);showCard('adaptive','Precision controller · int8 + selective float32',data.adaptive);addMetric(document.getElementById('adaptive'),'Audio rechecked',`${data.adaptive.repair_audio_seconds} / ${data.adaptive.budget_seconds} s target`);if(data.adaptive.budget_overrun_seconds)addMetric(document.getElementById('adaptive'),'Target overrun',data.adaptive.budget_overrun_seconds+' s');showDecisions(data.adaptive);document.getElementById('method').textContent=`Checkpoint: ${data.checkpoint} · Model file: ${data.model_file_mb} MB · Device: ${data.device.system} ${data.device.machine}. ${data.method}. ${data.limitations}`;document.getElementById('results').classList.remove('hidden');status.textContent='Comparison complete';document.getElementById('results').scrollIntoView({behavior:'smooth'})}catch(err){status.textContent=err.message;status.className='status error'}finally{button.disabled=false}};
 </script>
 </body></html>

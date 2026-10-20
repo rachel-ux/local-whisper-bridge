@@ -13,6 +13,7 @@ dependencies = [
   "python-multipart>=0.0.9,<1",
   "faster-whisper>=1.1,<2",
   "av>=11,<19",
+  "httpx>=0.27,<1",
 ]
 
 [project.optional-dependencies]
@@ -25,4 +26,4 @@ local-whisper-bridge = "local_whisper_bridge.cli:main"
 include = ["local_whisper_bridge*"]
 
 [tool.setuptools.package-data]
-local_whisper_bridge = ["lab.html"]
+local_whisper_bridge = ["lab.html", "openai.html"]

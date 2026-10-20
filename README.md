@@ -2,9 +2,17 @@
 
 A small FastAPI service that lets another app send an audio file to a Whisper model running **on the same computer**. It implements the common `POST /v1/audio/transcriptions` request shape, so clients that can change their transcription API base URL can point to it. It does not capture audio from other apps or modify Wispr Flow.
 
+## Real OpenAI Whisper calls
+
+Open **http://127.0.0.1:8765/openai** for a plain working interface to OpenAI's `whisper-1` API. You can upload a file or record rolling six-second microphone clips. Each completed clip makes a separate real call to `https://api.openai.com/v1/audio/transcriptions`; it is **near-live chunked transcription**, not a persistent Realtime WebSocket. Text and errors come from the actual API response. The server keeps the key out of browser code.
+
+After you add your own key, put `OPENAI_API_KEY=...` in this project's `.env.local` (which is gitignored) or set it in the server environment. The server reads `.env.local` on each request, so you can click **Check key again** without restarting. Do not paste your key into the browser page or commit it. The `/openai/status` endpoint reports only whether a key is configured, never its value. If no key is present, the cloud controls stay disabled and the local lab still works. OpenAI requests require internet and incur API charges; the local lab does neither.
+
+The cloud endpoint is `POST /openai/transcribe` with multipart `file`, optional `language`, and optional `prompt`. It validates type and size, blocks cross-origin browser posts, and maps authentication, rate-limit, timeout, and provider errors to safe messages. It does not silently fall back to a demo transcript.
+
 ## Whisper Device Lab: same-model optimization POC
 
-The browser lab at **http://127.0.0.1:8765/lab** can record from your microphone or accept a short audio file. It runs the **same selected Whisper checkpoint** twice in separate CPU processes: a float32 baseline and an int8 execution variant. It displays both transcripts, load and inference time, and peak process memory. If you paste a human-verified transcript, it also calculates word error rate for both runs. The lab uses the device's microphone only after you click Record; the audio stays on this computer and the temporary upload is removed after comparison.
+The browser lab at **http://127.0.0.1:8765/lab** can record from your microphone or accept a short audio file. It runs the **same selected Whisper checkpoint** as a full float32 baseline and an int8 variant, then applies a risk-directed precision controller. The controller scores int8 transcript spans using decoder log probability, repetitive output, and independent voice activity detection; it rechecks the highest-risk nonoverlapping spans in float32 within your chosen audio-duration budget. It shows the actual spans, reasons, before/after words, inference time, and peak process memory. If you paste a human-verified transcript, it also calculates word error rate for each run. The lab uses the device's microphone only after you click Record; the audio stays on this computer and the temporary upload is removed after comparison.
 
 To launch it from this checkout:
 
@@ -22,7 +30,9 @@ curl http://127.0.0.1:8765/lab/compare \
   -F reference='human verified words'
 ```
 
-This is a **runtime quantization experiment**, not yet a deployable phone or Apple Watch app. CTranslate2 converts the loaded model to the chosen compute precision; the original checkpoint file is the same for both runs. Peak memory includes Python and runtime overhead and can sometimes be higher for int8 on short recordings. File-system cache and CPU temperature can affect sequential timings. The POC makes these tradeoffs visible instead of claiming a universal speedup. A watch claim would require a native watchOS runtime and on-watch measurements of latency, memory, battery, and sustained recording.
+This is a **same-model adaptive-precision experiment**, not yet a deployable phone or Apple Watch app. The risk policy is implemented in `local_whisper_bridge/precision.py`; it is a heuristic proposed for this POC, not a proven novel research result or calibrated error detector. It can miss confidently wrong text; a float32 recheck can remain wrong or even be worse. CTranslate2 changes execution precision at load; the original checkpoint file is unchanged. Peak memory includes Python and runtime overhead and can be higher for int8 or adaptive runs. File-system cache and CPU temperature can affect sequential timings. A watch claim would require a native watchOS runtime and on-watch measurements of latency, memory, battery, and sustained recording.
+
+The score is calculated from each real segment's decoder log probability, compression ratio, and no-speech probability, plus an independent voice-activity pass that finds speech with no transcript. Candidates are ranked by risk per second and rechecked within the selected target. A short recording can overrun the target by one indivisible risky utterance; the API reports that overrun. The application never inserts preset transcript text. The default target is 30%, and the UI slider lets you change it from 0% (no rechecks) to 100%.
 
 The default model is multilingual `tiny` running on CPU with int8 quantization. The optional **coverage-aware adaptive repair** strategy makes a fast pass in 12-second windows. It compares the draft transcript against independent speech detection, spends its repair budget on speech that produced no text, then ranks uncertain spans by estimated benefit per second. Only those parts of the recording go through a second, larger model. This routing and budgeting logic is implemented here; CTranslate2's int8 inference itself comes from faster-whisper. There is no cloud fallback. Model weights are downloaded only by the explicit `prepare` command; after that, transcription can work with the network disconnected.
 
